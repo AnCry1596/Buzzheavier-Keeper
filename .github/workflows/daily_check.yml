@@ -1,0 +1,33 @@
+name: Daily BuzzHeavier Link Keep-Alive
+
+on:
+  schedule:
+    # Runs everyday at 03:00 UTC (10:00 AM UTC+7)
+    - cron: '0 3 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+  push:
+    paths:
+      - 'links.txt' # Runs automatically when links.txt is updated
+
+jobs:
+  check-links:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download Last Byte of Each Link
+        run: |
+          python get_download_link.py links.txt -l
