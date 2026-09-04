@@ -7,6 +7,8 @@ A fast, lightweight Python tool and automated GitHub Action to resolve direct do
 ## ⚡ Features
 
 - **🚀 Ultra-Fast Resolution:** Uses `curl-cffi` with browser TLS fingerprint impersonation (`chrome124` / `chrome131`) to bypass Cloudflare protection in ~1 second without running heavy headless browsers.
+- **🔄 Resilient Retry & Anti-Blocking Logic:** Built-in exponential backoff, jitter, and browser fingerprint rotation (`chrome124`, `chrome131`, `safari17_0`, `safari18_0`, `chrome120`) to effortlessly overcome transient Cloudflare challenges.
+- **⏱️ Smart Batch Pacing & Recovery Pass:** Introduces configurable pacing delay between links (default `1.0s`) to prevent triggering rate limits on large batches (100+ links), plus an automatic secondary retry pass for any links that experienced temporary hiccups.
 - **🛡️ Bandwidth-Friendly Keep-Alive:** Uses HTTP Range requests (`Range: bytes=-1`) to download only the **last 1 byte** of large files (e.g. 15GB+ files) to ping the CDN and keep links alive with virtually zero bandwidth usage.
 - **🔗 Dual Link Extraction:**
   - **Tokenized Link:** `https://buzzheavier.com/<id>/download?t=...` (HMAC-SHA256 signed URL).
@@ -14,6 +16,7 @@ A fast, lightweight Python tool and automated GitHub Action to resolve direct do
 - **📋 Batch Processing:** Process multiple links from a text file (`links.txt`).
 - **🤖 Automated GitHub Action:** Daily scheduled workflow that automatically checks every link in `links.txt` and logs results to GitHub Actions Step Summary.
 - **🔍 Byte Inspection:** Verify stream health by downloading and inspecting the first 1 byte (`-b`), last 1 byte (`-l`), or full file (`-d`).
+
 
 ---
 
@@ -66,6 +69,20 @@ Ping the last byte of every link listed in `links.txt`:
 ```bash
 python get_download_link.py links.txt -l
 ```
+
+#### Advanced Batch & Retry Options:
+| Flag | Default | Description |
+|---|---|---|
+| `--delay <seconds>` | `1.0` | Pacing delay between batch links to prevent Cloudflare rate limits |
+| `--retries <count>` | `3` | Max retries per link upon Cloudflare challenges or network hiccups |
+| `--retry-delay <seconds>` | `2.0` | Base delay for exponential backoff on retries |
+| `--no-retry-pass` | `false` | Disable automatic secondary retry pass for failed items |
+
+Example with custom rate limiting and retry tuning:
+```bash
+python get_download_link.py links.txt -l --delay 1.5 --retries 3 --retry-delay 2.5
+```
+
 
 ### 7. Output as JSON (`--json`)
 For integration into automated scripts:
