@@ -89,7 +89,7 @@ def resolve_buzzheavier_link(
 
     # Browser TLS fingerprint candidates to rotate on retry
     candidate_impersonates = [impersonate]
-    for alt in ["chrome131", "chrome124", "safari17_0", "safari18_0", "chrome120", "firefox133"]:
+    for alt in ["chrome146", "chrome145", "safari17_0", "safari172_ios", "safari180", "safari180_ios", "safari184", "safari184_ios", "safari260", "safari260_ios", "safari2601", "firefox144", "firefox147"]:
         if alt not in candidate_impersonates:
             candidate_impersonates.append(alt)
 
