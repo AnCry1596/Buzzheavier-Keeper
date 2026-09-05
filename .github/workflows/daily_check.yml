@@ -4,15 +4,72 @@ on:
   schedule:
     # Runs everyday at 03:00 UTC (10:00 AM UTC+7)
     - cron: '0 3 * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: 'Number of parallel runner shards'
+        required: false
+        default: '5'
+        type: choice
+        options:
+          - '1'
+          - '3'
+          - '5'
+          - '8'
+          - '10'
+      delay:
+        description: 'Pacing delay between requests per runner (seconds)'
+        required: false
+        default: '1.0'
+        type: string
+      workers:
+        description: 'Worker threads per runner'
+        required: false
+        default: '1'
+        type: string
+      retries:
+        description: 'Max retries on transient Cloudflare challenges'
+        required: false
+        default: '3'
+        type: string
+      soft_fail:
+        description: 'Do not fail workflow if dead/expired (404) links are found'
+        required: false
+        default: true
+        type: boolean
   push:
     paths:
       - 'links.txt' # Runs automatically when links.txt is updated
 
 jobs:
-  check-links:
+  init-matrix:
+    name: Initialize Parallel Runner Matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      total_shards: ${{ steps.set-matrix.outputs.total_shards }}
+    steps:
+      - name: Compute Shard Count
+        id: set-matrix
+        run: |
+          SHARD_COUNT="${{ inputs.shards || '5' }}"
+          python -c "
+          import json
+          count = max(1, int('$SHARD_COUNT'))
+          shards = list(range(1, count + 1))
+          print(f'matrix={json.dumps(shards)}')
+          print(f'total_shards={count}')
+          " >> "$GITHUB_OUTPUT"
+
+  check-links:
+    name: Shard ${{ matrix.shard }}
+    needs: init-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.init-matrix.outputs.matrix) }}
 
     steps:
       - name: Checkout Repository
@@ -29,8 +86,65 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Link Keep-Alive Check
+      - name: Run Shard Keep-Alive Check
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          python get_download_link.py links.txt -l --delay 1.0 --retries 3 --retry-delay 2.0
+          SHARD_ARG="${{ matrix.shard }}/${{ needs.init-matrix.outputs.total_shards }}"
+          DELAY_ARG="${{ inputs.delay || '1.0' }}"
+          WORKERS_ARG="${{ inputs.workers || '1' }}"
+          RETRIES_ARG="${{ inputs.retries || '3' }}"
+          SOFT_FAIL_FLAG="${{ (inputs.soft_fail != false) && '--soft-fail' || '' }}"
+
+          python get_download_link.py links.txt -l \
+            --shard "$SHARD_ARG" \
+            --delay "$DELAY_ARG" \
+            --workers "$WORKERS_ARG" \
+            --retries "$RETRIES_ARG" \
+            --retry-delay 2.0 \
+            --output-json "reports/shard_${{ matrix.shard }}.json" \
+            --failed-file "reports/failed_${{ matrix.shard }}.txt" \
+            $SOFT_FAIL_FLAG
+
+      - name: Upload Shard Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-result-${{ matrix.shard }}
+          path: reports/
+          retention-days: 7
+
+  aggregate-summary:
+    name: Aggregate & Publish Report
+    needs: [init-matrix, check-links]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download all Shard Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-result-*
+          merge-multiple: true
+          path: all_reports
+
+      - name: Generate Consolidated Summary & Dead Links List
+        run: |
+          SOFT_FAIL_FLAG="${{ (inputs.soft_fail != false) && '--soft-fail' || '' }}"
+          python .github/scripts/aggregate_reports.py all_reports --output-failed dead_links.txt $SOFT_FAIL_FLAG
+
+      - name: Upload Dead Links Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dead-links-report
+          path: dead_links.txt
+          retention-days: 30
+          if-no-files-found: ignore

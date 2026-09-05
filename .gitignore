@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+reports/
+all_reports/
+dead_links.txt
+test_shard*.json
+*.log

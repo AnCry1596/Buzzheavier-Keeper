@@ -70,17 +70,24 @@ Ping the last byte of every link listed in `links.txt`:
 python get_download_link.py links.txt -l
 ```
 
-#### Advanced Batch & Retry Options:
+#### Advanced Batch & Scaling Options:
 | Flag | Default | Description |
 |---|---|---|
 | `--delay <seconds>` | `1.0` | Pacing delay between batch links to prevent Cloudflare rate limits |
+| `--shard <X/Y>` | `1/1` | Run shard `X` out of `Y` total shards (e.g. `1/5` for runner 1 of 5) |
+| `--workers <count>` | `1` | Number of concurrent worker threads within each runner |
 | `--retries <count>` | `3` | Max retries per link upon Cloudflare challenges or network hiccups |
 | `--retry-delay <seconds>` | `2.0` | Base delay for exponential backoff on retries |
+| `--output-json <path>` | `None` | Export structured check results to a JSON file |
+| `--failed-file <path>` | `None` | Export list of failed/dead links (404/expired) for pruning |
+| `--soft-fail` | `false` | Return exit code 0 even if dead or failed links are encountered |
+| `--max-fail-rate <0.0-1.0>` | `None` | Maximum failure rate allowed before returning exit code 1 |
 | `--no-retry-pass` | `false` | Disable automatic secondary retry pass for failed items |
 
-Example with custom rate limiting and retry tuning:
+Example with sharding and rate limit tuning:
 ```bash
-python get_download_link.py links.txt -l --delay 1.5 --retries 3 --retry-delay 2.5
+# Check shard 1 of 5 runners with soft-fail and JSON output
+python get_download_link.py links.txt -l --shard 1/5 --delay 1.0 --output-json shard_1.json --soft-fail
 ```
 
 
@@ -92,9 +99,16 @@ python get_download_link.py yebbjo1kfx3b --json
 
 ---
 
-## ⚙️ Automated GitHub Action (Daily Keep-Alive)
+## ⚙️ Automated GitHub Action (Large-Scale Daily Keep-Alive)
 
-The repository includes a GitHub Actions workflow in [`.github/workflows/daily_check.yml`](.github/workflows/daily_check.yml).
+The repository includes a distributed GitHub Actions workflow in [`.github/workflows/daily_check.yml`](.github/workflows/daily_check.yml) optimized for large collections of links (800 to 5,000+ links).
+
+### 🚀 Architecture Highlights:
+- **⚡ Parallel Matrix Sharding (5x–10x Speedup):** Automatically partitions `links.txt` across **5 parallel runner jobs** (configurable from 1 to 10 via manual trigger).
+- **🌐 Distributed Multi-IP Requests:** Each GitHub Action runner executes on an independent VM with a distinct public IP address, eliminating Cloudflare rate limits and IP blocking.
+- **🧹 Automatic Link Deduplication:** Deduplicates redundant entries from `links.txt` before sharding to avoid duplicate requests.
+- **🛡️ Soft-Fail & Dead Link Isolation:** Dead/expired links (HTTP 404) are isolated into a downloadable `dead-links-report` workflow artifact instead of crashing the entire keep-alive workflow.
+- **📊 Consolidated Step Summary:** A final reporting job aggregates all shard outputs and publishes an overview dashboard with success rates, failed link tables, and collapsible sections.
 
 ### How It Works:
 1. Add your file links to `links.txt` (one link per line):
@@ -104,7 +118,8 @@ The repository includes a GitHub Actions workflow in [`.github/workflows/daily_c
    ```
 2. Commit and push your changes to GitHub.
 3. The workflow runs **every day at 03:00 UTC** (and on every push to `links.txt`).
-4. It downloads the last 1 byte of each link and publishes a clean summary table under the **Actions** tab.
+4. You can also trigger it manually from the **Actions** tab with custom shard counts (1, 3, 5, 8, 10), delay, worker threads, and soft-fail settings.
+5. Review the run dashboard and download `dead_links.txt` to remove expired files as needed.
 
 ---
 

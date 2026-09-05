@@ -12,7 +12,9 @@ import argparse
 import io
 import time
 import random
-from typing import Dict, Any, Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Any, Optional, List, Tuple
 
 # Ensure UTF-8 output across all platforms (especially Windows)
 if hasattr(sys.stdout, "reconfigure"):
@@ -297,11 +299,35 @@ def download_file(url: str, output_path: Optional[str] = None, impersonate: str 
     print("\n[+] Download complete!")
 
 
-def process_single_item(idx: int, total: int, line: str, args) -> Dict[str, Any]:
+def parse_shard_spec(spec: Optional[str]) -> Tuple[int, int]:
+    """Parses shard specification string in format 'X/Y' (e.g. '1/5') or returns (1, 1)."""
+    if not spec:
+        return 1, 1
+    m = re.match(r"^(\d+)[/:](\d+)$", spec.strip())
+    if not m:
+        raise ValueError(f"Invalid shard format: '{spec}'. Expected format 'X/Y' (e.g. '1/5').")
+    shard_idx = int(m.group(1))
+    total_shards = int(m.group(2))
+    if total_shards < 1:
+        raise ValueError(f"Total shards must be >= 1, got {total_shards}.")
+    if shard_idx < 1 or shard_idx > total_shards:
+        raise ValueError(f"Shard index {shard_idx} out of bounds for total shards {total_shards} (must be 1..{total_shards}).")
+    return shard_idx, total_shards
+
+
+def process_single_item(idx: int, total: int, line: str, args, log_lock: Optional[threading.Lock] = None) -> Dict[str, Any]:
     """Processes a single link/ID with full resolution, byte pings, and downloads."""
     file_id = parse_file_id(line)
-    retries = getattr(args, "retries", 3)
+    retries = getattr(args, "retries", 10)
     retry_delay = getattr(args, "retry_delay", 2.0)
+
+    def log(msg: str):
+        if log_lock:
+            with log_lock:
+                print(msg)
+        else:
+            print(msg)
+
     data = resolve_buzzheavier_link(
         file_id,
         impersonate=args.impersonate,
@@ -310,7 +336,7 @@ def process_single_item(idx: int, total: int, line: str, args) -> Dict[str, Any]
     )
     file_name = data.get('file_name') or line
     file_size = data.get('file_size') or "N/A"
-    print(f"    File     : {file_name} ({file_size})")
+    log(f"    File     : {file_name} ({file_size})")
 
     byte_info = "-"
     if args.last_byte:
@@ -324,7 +350,7 @@ def process_single_item(idx: int, total: int, line: str, args) -> Dict[str, Any]
             val = b[0]
             char_repr = repr(chr(val)) if 32 <= val <= 126 else repr(b)
             byte_info = f"0x{val:02x} ({char_repr})"
-            print(f"    Last Byte: {b} (Hex: 0x{val:02x}, Repr: {char_repr}) -> SUCCESS")
+            log(f"    Last Byte: {b} (Hex: 0x{val:02x}, Repr: {char_repr}) -> SUCCESS")
         else:
             raise RuntimeError("Failed to fetch last byte from CDN")
 
@@ -339,119 +365,262 @@ def process_single_item(idx: int, total: int, line: str, args) -> Dict[str, Any]
             val = b[0]
             char_repr = repr(chr(val)) if 32 <= val <= 126 else repr(b)
             byte_info = f"0x{val:02x} ({char_repr})"
-            print(f"    First Byte: {b} (Hex: 0x{val:02x}, Repr: {char_repr}) -> SUCCESS")
+            log(f"    First Byte: {b} (Hex: 0x{val:02x}, Repr: {char_repr}) -> SUCCESS")
 
     if args.download:
         download_file(data["direct_cdn_url"], output_path=args.output, impersonate=args.impersonate)
 
     return {
         "idx": idx,
+        "link": line,
+        "file_id": file_id,
         "name": file_name,
         "size": file_size,
         "byte": byte_info,
         "status": "✅ OK",
         "success": True,
+        "error": None,
     }
 
 
 def process_batch(file_path: str, args):
-    """Processes a list of links/IDs from a file with rate-limiting and recovery retry pass."""
+    """Processes a list of links/IDs from a file with deduplication, sharding, pacing, and recovery retry pass."""
     if not os.path.exists(file_path):
         print(f"[!] File not found: {file_path}")
         sys.exit(1)
 
     with open(file_path, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+        raw_lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
-    if not lines:
+    if not raw_lines:
         print(f"[!] No valid links found in {file_path}")
         return
 
-    print("=" * 55)
-    print(f"  BATCH PROCESSING: {len(lines)} LINK(S)")
-    print(f"  Pacing: {args.delay}s delay | Retries: {args.retries} | Retry Backoff: {args.retry_delay}s")
-    print("=" * 55)
-
-    pace_delay = getattr(args, "delay", 1.0)
-    results: Dict[int, Dict[str, Any]] = {}
-    failed_indices = []
-
-    # Pass 1: Process all items sequentially with inter-request pacing delay
-    for idx, line in enumerate(lines, 1):
-        if idx > 1 and pace_delay > 0:
-            jitter = random.uniform(-0.2, 0.3)
-            time.sleep(max(0.1, pace_delay + jitter))
-
-        print(f"\n[{idx}/{len(lines)}] Target: {line}")
+    # Deduplicate while preserving order
+    seen_ids = set()
+    unique_lines: List[str] = []
+    for line in raw_lines:
         try:
-            res = process_single_item(idx, len(lines), line, args)
-            results[idx] = res
-        except Exception as e:
-            print(f"    [FAIL] Error: {e}")
-            results[idx] = {
-                "idx": idx,
-                "name": line,
-                "size": "N/A",
-                "byte": "-",
-                "status": f"❌ {e}",
-                "success": False,
-            }
-            failed_indices.append(idx)
+            fid = parse_file_id(line)
+        except Exception:
+            fid = line
+        if fid not in seen_ids:
+            seen_ids.add(fid)
+            unique_lines.append(line)
 
-    # Pass 2: Automatic retry pass for failed links (if any)
+    if len(unique_lines) < len(raw_lines):
+        print(f"[*] Deduplicated {len(raw_lines)} links -> {len(unique_lines)} unique links (removed {len(raw_lines) - len(unique_lines)} duplicates).")
+
+    # Shard partitioning
+    shard_str = getattr(args, "shard", None)
+    shard_idx, total_shards = parse_shard_spec(shard_str)
+
+    # Assign items via round-robin modulo: orig_idx (1-indexed)
+    shard_items: List[Tuple[int, str]] = [
+        (orig_idx, line)
+        for orig_idx, line in enumerate(unique_lines, 1)
+        if (orig_idx - 1) % total_shards == (shard_idx - 1)
+    ]
+
+    workers = max(1, getattr(args, "workers", 1))
+    pace_delay = getattr(args, "delay", 1.0)
+    retries = getattr(args, "retries", 3)
+    retry_delay = getattr(args, "retry_delay", 2.0)
+
+    print("=" * 60)
+    if total_shards > 1:
+        print(f"  BATCH PROCESSING (SHARD {shard_idx}/{total_shards}): {len(shard_items)} of {len(unique_lines)} LINK(S)")
+    else:
+        print(f"  BATCH PROCESSING: {len(shard_items)} LINK(S)")
+    print(f"  Pacing: {pace_delay}s delay | Workers: {workers} | Retries: {retries} | Retry Backoff: {retry_delay}s")
+    print("=" * 60)
+
+    results: Dict[int, Dict[str, Any]] = {}
+    failed_items: List[Tuple[int, str]] = []
+    log_lock = threading.Lock()
+
+    def log(msg: str):
+        with log_lock:
+            print(msg)
+
+    # Pass 1: Process items
+    if workers > 1:
+        def worker_task(sub_idx: int, orig_idx: int, line: str):
+            jitter = random.uniform(0.1, 0.5)
+            time.sleep(jitter)
+            log(f"\n[{sub_idx}/{len(shard_items)}] (Link #{orig_idx}) Target: {line}")
+            try:
+                res = process_single_item(orig_idx, len(unique_lines), line, args, log_lock=log_lock)
+                return orig_idx, res, None
+            except Exception as e:
+                log(f"    [FAIL] Error: {e}")
+                err_dict = {
+                    "idx": orig_idx,
+                    "link": line,
+                    "file_id": parse_file_id(line) if 'buzzheavier' in line or len(line) <= 16 else line,
+                    "name": line,
+                    "size": "N/A",
+                    "byte": "-",
+                    "status": f"❌ {e}",
+                    "success": False,
+                    "error": str(e),
+                }
+                return orig_idx, err_dict, (orig_idx, line)
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(worker_task, sub_idx, orig_idx, line)
+                for sub_idx, (orig_idx, line) in enumerate(shard_items, 1)
+            ]
+            for future in as_completed(futures):
+                orig_idx, res, fail_entry = future.result()
+                results[orig_idx] = res
+                if fail_entry:
+                    failed_items.append(fail_entry)
+    else:
+        # Sequential processing
+        for sub_idx, (orig_idx, line) in enumerate(shard_items, 1):
+            if sub_idx > 1 and pace_delay > 0:
+                jitter = random.uniform(-0.2, 0.3)
+                time.sleep(max(0.1, pace_delay + jitter))
+
+            print(f"\n[{sub_idx}/{len(shard_items)}] (Link #{orig_idx}) Target: {line}")
+            try:
+                res = process_single_item(orig_idx, len(unique_lines), line, args)
+                results[orig_idx] = res
+            except Exception as e:
+                print(f"    [FAIL] Error: {e}")
+                results[orig_idx] = {
+                    "idx": orig_idx,
+                    "link": line,
+                    "file_id": parse_file_id(line) if 'buzzheavier' in line or len(line) <= 16 else line,
+                    "name": line,
+                    "size": "N/A",
+                    "byte": "-",
+                    "status": f"❌ {e}",
+                    "success": False,
+                    "error": str(e),
+                }
+                failed_items.append((orig_idx, line))
+
+    # Pass 2: Automatic retry pass for failed links
     no_retry_pass = getattr(args, "no_retry_pass", False)
-    if failed_indices and not no_retry_pass:
-        print("\n" + "=" * 55)
-        print(f"  RETRY PASS: Re-attempting {len(failed_indices)} failed link(s) after 5s cool-down...")
-        print("=" * 55)
+    if failed_items and not no_retry_pass:
+        print("\n" + "=" * 60)
+        print(f"  RETRY PASS: Re-attempting {len(failed_items)} failed link(s) after 5s cool-down...")
+        print("=" * 60)
         time.sleep(5.0)
 
         recovered_count = 0
-        still_failed = []
-        for f_idx in failed_indices:
-            line = lines[f_idx - 1]
+        still_failed: List[Tuple[int, str]] = []
+        for orig_idx, line in failed_items:
             if pace_delay > 0:
                 jitter = random.uniform(-0.2, 0.3)
                 time.sleep(max(0.1, pace_delay + jitter))
 
-            print(f"\n[Retry Pass: {f_idx}/{len(lines)}] Target: {line}")
+            print(f"\n[Retry Pass: Link #{orig_idx}] Target: {line}")
             try:
-                res = process_single_item(f_idx, len(lines), line, args)
-                results[f_idx] = res
+                res = process_single_item(orig_idx, len(unique_lines), line, args)
+                results[orig_idx] = res
                 recovered_count += 1
                 print("    -> [RECOVERED] Successfully resolved on retry pass!")
             except Exception as e:
                 print(f"    -> [FAIL] Still failed on retry pass: {e}")
-                results[f_idx]["status"] = f"❌ {e}"
-                still_failed.append(f_idx)
+                results[orig_idx]["status"] = f"❌ {e}"
+                results[orig_idx]["error"] = str(e)
+                still_failed.append((orig_idx, line))
 
-        failed_indices = still_failed
-        print(f"\n[*] Retry pass finished: {recovered_count} recovered, {len(failed_indices)} remaining failed.")
+        failed_items = still_failed
+        print(f"\n[*] Retry pass finished: {recovered_count} recovered, {len(failed_items)} remaining failed.")
 
-    report_rows = [results[i] for i in sorted(results.keys())]
+    report_rows = [results[k] for k in sorted(results.keys())]
     succeeded = sum(1 for r in report_rows if r.get("success", False))
     failed = len(report_rows) - succeeded
+    success_rate = (succeeded / len(report_rows) * 100.0) if report_rows else 0.0
 
-    print("\n" + "=" * 55)
-    print(f"  BATCH SUMMARY: {succeeded}/{len(lines)} succeeded, {failed} failed.")
-    print("=" * 55)
+    print("\n" + "=" * 60)
+    shard_label = f"SHARD {shard_idx}/{total_shards} " if total_shards > 1 else ""
+    print(f"  {shard_label}BATCH SUMMARY: {succeeded}/{len(shard_items)} succeeded ({success_rate:.1f}%), {failed} failed.")
+    print("=" * 60)
+
+    # Export JSON if requested
+    output_json = getattr(args, "output_json", None)
+    if output_json:
+        out_dir = os.path.dirname(output_json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        summary_payload = {
+            "shard_index": shard_idx,
+            "total_shards": total_shards,
+            "total_unique_links": len(unique_lines),
+            "shard_items_count": len(shard_items),
+            "succeeded": succeeded,
+            "failed": failed,
+            "success_rate": round(success_rate, 2),
+            "items": report_rows,
+            "failed_items": [r for r in report_rows if not r.get("success", False)]
+        }
+        with open(output_json, "w", encoding="utf-8") as jf:
+            json.dump(summary_payload, jf, indent=2, ensure_ascii=False)
+        print(f"[+] Exported results to JSON: {output_json}")
+
+    # Export failed items file if requested
+    failed_file = getattr(args, "failed_file", None)
+    if failed_file:
+        out_dir = os.path.dirname(failed_file)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        failed_rows = [r for r in report_rows if not r.get("success", False)]
+        with open(failed_file, "w", encoding="utf-8") as ff:
+            for fr in failed_rows:
+                ff.write(f"{fr['link']}  # {fr.get('status', 'Failed')}\n")
+        if failed_rows:
+            print(f"[+] Written {len(failed_rows)} failed link(s) to: {failed_file}")
 
     # Write summary to GitHub Actions if running in CI
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_file:
         try:
             with open(summary_file, "a", encoding="utf-8") as sf:
-                sf.write("### 🐝 BuzzHeavier Daily Keep-Alive Report\n\n")
-                sf.write("| # | File Name | Size | Last Byte | Status |\n")
-                sf.write("|---|-----------|------|-----------|--------|\n")
-                for r in report_rows:
-                    sf.write(f"| {r['idx']} | {r['name']} | {r['size']} | `{r['byte']}` | {r['status']} |\n")
-                sf.write(f"\n**Total:** {succeeded}/{len(lines)} succeeded, {failed} failed.\n")
-        except Exception:
-            pass
+                title_suffix = f" — Shard {shard_idx}/{total_shards}" if total_shards > 1 else ""
+                sf.write(f"### 🐝 BuzzHeavier Keep-Alive Report{title_suffix}\n\n")
+                sf.write("| Metric | Value |\n")
+                sf.write("|---|---|\n")
+                sf.write(f"| **Assigned Links** | {len(shard_items)} |\n")
+                sf.write(f"| **✅ Succeeded** | {succeeded} |\n")
+                sf.write(f"| **❌ Failed / Dead** | {failed} |\n")
+                sf.write(f"| **📈 Success Rate** | {success_rate:.1f}% |\n\n")
 
+                failed_list = [r for r in report_rows if not r.get("success", False)]
+                if failed_list:
+                    sf.write("#### ⚠️ Dead / Failed Links\n\n")
+                    sf.write("| # | Link | Error Reason |\n")
+                    sf.write("|---|------|--------------|\n")
+                    for fl in failed_list:
+                        sf.write(f"| {fl['idx']} | {fl['link']} | {fl['status']} |\n")
+                    sf.write("\n")
+
+                success_list = [r for r in report_rows if r.get("success", False)]
+                if success_list:
+                    sf.write(f"<details><summary><b>📁 View Active Links ({len(success_list)})</b></summary>\n\n")
+                    sf.write("| # | File Name | Size | Last Byte | Status |\n")
+                    sf.write("|---|-----------|------|-----------|--------|\n")
+                    for sl in success_list:
+                        sf.write(f"| {sl['idx']} | {sl['name']} | {sl['size']} | `{sl['byte']}` | {sl['status']} |\n")
+                    sf.write("\n</details>\n\n")
+        except Exception as e:
+            print(f"[!] Warning: Unable to write to GITHUB_STEP_SUMMARY: {e}")
+
+    # Exit code determination
+    soft_fail = getattr(args, "soft_fail", False)
+    max_fail_rate = getattr(args, "max_fail_rate", None)
     if failed > 0:
-        sys.exit(1)
+        if soft_fail:
+            print(f"[!] Notice: {failed} link(s) failed or dead. Workflow continuing due to --soft-fail.")
+        elif max_fail_rate is not None and (failed / len(shard_items)) <= max_fail_rate:
+            print(f"[!] Notice: Failure rate {(failed / len(shard_items)):.1%} is within allowable threshold ({max_fail_rate:.1%}). Continuing.")
+        else:
+            sys.exit(1)
 
 
 def main():
@@ -518,6 +687,35 @@ def main():
         "--no-retry-pass",
         action="store_true",
         help="Disable automatic secondary retry pass for failed links in batch mode"
+    )
+    parser.add_argument(
+        "--shard",
+        help="Shard specification in format 'X/Y' (e.g. '1/5' for runner 1 of 5)"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent worker threads per runner (default: 1)"
+    )
+    parser.add_argument(
+        "--output-json",
+        help="Path to export batch check results as JSON"
+    )
+    parser.add_argument(
+        "--failed-file",
+        help="Path to write failed/dead links for pruning"
+    )
+    parser.add_argument(
+        "--soft-fail",
+        action="store_true",
+        help="Do not return exit code 1 if dead or failed links are encountered"
+    )
+    parser.add_argument(
+        "--max-fail-rate",
+        type=float,
+        default=None,
+        help="Maximum failure rate (0.0 - 1.0) allowed before exiting with code 1"
     )
 
     args = parser.parse_args()
