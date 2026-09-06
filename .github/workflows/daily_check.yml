@@ -9,7 +9,7 @@ on:
       shards:
         description: 'Number of parallel runner shards'
         required: false
-        default: '5'
+        default: '50'
         type: choice
         options:
           - '1'
