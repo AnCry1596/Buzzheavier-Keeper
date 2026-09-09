@@ -2,8 +2,8 @@ name: Daily BuzzHeavier Link Keep-Alive
 
 on:
   schedule:
-    # Runs everyday at 03:00 UTC (10:00 AM UTC+7)
-    - cron: '0 3 * * *'
+    # Runs every 8 hours at 03:00, 11:00, and 19:00 UTC
+    - cron: '0 3,11,19 * * *'
   workflow_dispatch:
     inputs:
       shards:
